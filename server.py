@@ -30,11 +30,14 @@ def fetch(ticker):
     def put(k,v,desc): x[k]=v; evidence[k]=desc if v is not None else 'Missing — verify and enter a value.'
     def row(frame,date,*keys):
         for k in keys:
-            if date in frame.columns and k in frame.index:
-                n=num(frame.loc[k,date])
-                if n is not None:return n
+            if k in frame.index and date is not None:
+                for col in frame.columns:
+                    if str(col)[:10]==str(date)[:10]:
+                        n=num(frame.loc[k,col])
+                        if n is not None:return n
         return None
-    date=max(inc.columns) if len(inc.columns) else None
+    dates=sorted(inc.columns,reverse=True)
+    date=next((d for d in dates if row(inc,d,'TotalRevenue','OperatingRevenue') is not None and row(inc,d,'OperatingIncome','EBIT') is not None),dates[0] if dates else None)
     ds='Annual statements '+str(date)
     close=num(hist['Close'].dropna().iloc[-1]); quote_date=str(hist['Close'].dropna().index[-1]); currency=info.get('currency'); fin=info.get('financialCurrency')
     if not currency or not fin: raise ValueError('Missing currency information.')
@@ -49,7 +52,7 @@ def fetch(ticker):
     da=row(cf,date,'DepreciationAndAmortization','DepreciationAmortizationDepletion');capex=row(cf,date,'CapitalExpenditure');tax=ratio(row(inc,date,'TaxProvision'),row(inc,date,'PretaxIncome'))
     put('revenue',bn(rev),ds+' revenue');put('ebit',ratio(ebit,rev),ds+' operating margin');put('da',ratio(da,rev),ds+' D&A / revenue');put('capex',ratio(abs(capex) if capex is not None else None,rev),ds+' capex / revenue')
     put('earnings',bn(earn),ds+' net income, flat forecast proxy');put('tax',tax if tax is not None and 0<=tax<=50 else 25,'Reported effective tax if plausible; otherwise 25% assumption')
-    prior=sorted(inc.columns,reverse=True)[1] if len(inc.columns)>1 else None;prev=row(inc,prior,'TotalRevenue','OperatingRevenue')
+    prior=next((d for d in dates if date is not None and d<date and row(inc,d,'TotalRevenue','OperatingRevenue') is not None),None);prev=row(inc,prior,'TotalRevenue','OperatingRevenue')
     growth=ratio(rev-prev,prev) if rev is not None and prev is not None and prev>0 else None
     put('growth',max(-5,min(12,growth)) if growth is not None else 3,'Historical growth clipped to -5% to 12%; otherwise assumed 3%')
     put('grossDebt',bn(debt),ds+' debt');put('debt',bn(debt-cash) if debt is not None and cash is not None else None,ds+' debt minus cash');put('claims',bn(minority) if minority is not None else 0,'Reported minority interest or zero placeholder; verify other claims')
@@ -60,17 +63,43 @@ def fetch(ticker):
     interest=row(inc,date,'InterestExpense','InterestExpenseNonOperating');kd=ratio(abs(interest),debt) if interest is not None and debt else None
     put('kd',kd if kd is not None and 0<kd<=20 else 4.5,'Historical interest / debt or illustrative 4.5%')
     for k,v in [('rf',3),('erp',5),('wc',10),('terminal',2),('years',5),('multiple',15),('evEbit',12),('pb',1.5),('weight',70)]:put(k,v,'Illustrative editable assumption, not market consensus')
+    # For a verified company-specific FY fallback, keep all statement fields on the same period.
+    fallback=False
+    if ticker=='RMS.PA' and currency=='EUR' and any(x[k] is None for k in ('revenue','ebit','da','capex','grossDebt','debt')):
+        fallback=True
+        src='Hermès FY2025 official results, 12 Feb 2026: https://live.euronext.com/en/products/equities/company-news/2026-02-12-hermes-international-2025-full-year-results'
+        for k,v,desc in [
+            ('year',2025,'FY2025'),('revenue',16.002,'revenue EUR bn'),('ebit',6569/16002*100,'operating margin'),
+            ('da',926/16002*100,'D&A including right-of-use and impairment, proxy'),('capex',1161/16002*100,'operating investments / sales'),
+            ('grossDebt',2.346,'borrowings 34m plus lease liabilities 2312m'),('debt',2.346-12.239,'gross debt less cash, EUR bn'),
+            ('claims',.152,'noncontrolling interest 6m and employee benefit obligations 146m, proxy'),
+            ('earnings',4.524,'net income group share, flat forecast proxy'),('growth',(16002/15170-1)*100,'reported sales growth used as forecast proxy'),
+            ('tax',2263/6775*100,'reported effective tax')]:
+            put(k,v,src+' | '+desc)
+        if x['shares'] is None:put('shares',.105569412,src+' | issued shares (proxy)')
+        if x['shares']:put('book',18.840/x['shares'],src+' | book equity per share')
+        if x['dividend'] is not None and x['shares']:put('payout',min(100,max(0,x['dividend']*x['shares']/4.524*100)),'Trailing dividend and FY2025 net income')
+    if x['beta'] is None:put('beta',1.0,'Assumed market beta 1.0; not observed')
+    if x['earnings'] is None and x['shares'] is not None:
+        eps=num(info.get('trailingEps'))
+        if eps is not None:put('earnings',eps*x['shares'],'Yahoo trailing EPS times current shares; approximate LTM earnings')
+    if x['book'] is None:put('book',num(info.get('bookValue')),'Yahoo reported book value per share')
     if all(x[k] is not None for k in ('price','shares','grossDebt','beta')):
         E=x['price']*x['shares'];D=x['grossDebt'];ke=x['rf']+x['beta']*x['erp'];w=(E*ke+D*x['kd']*(1-x['tax']/100))/(E+D) if E+D>0 else None
         put('wacc',round(w,3) if w is not None else None,'Calculated from CAPM and above inputs')
     else:put('wacc',None,'Missing capital inputs')
     warnings=['Forecast inputs and selected multiples are illustrative, not consensus. Verify lease treatment, debt bridge, fiscal dates and currency. Prices may be delayed.']
-    x['source']=f'Yahoo Finance {ticker}; FY {date}; close {quote_date}; fetched {datetime.now(timezone.utc).isoformat()}. '+warnings[0]
+    if fallback:warnings.append('FY2025 official Hermès statements used as a dated fallback; latest market quote remains separate. Lease-inclusive debt bridge and D&A including impairment are approximations.')
+    missing=[k for k in ('revenue','ebit','da','capex','grossDebt','wacc','debt') if x[k] is None]
+    if missing and sector=='industrial':warnings.append('FCFF unavailable: '+', '.join(missing)+'. Use available equity methods only; no financial facts invented.')
+    x['source']=f'Yahoo Finance {ticker}; FY {x["year"]}; close {quote_date}; fetched {datetime.now(timezone.utc).isoformat()}. '+ ' '.join(warnings)
     return {'inputs':x,'evidence':evidence,'warnings':warnings}
 class Handler(BaseHTTPRequestHandler):
     def send(self,status,body,ctype):
         self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body)
     def js(self,status,obj):self.send(status,json.dumps(obj,allow_nan=False).encode(),'application/json; charset=utf-8')
+    def do_HEAD(self):
+        self.send_response(200);self.end_headers()
     def do_GET(self):
         p=urlparse(self.path)
         if p.path=='/':return self.send(200,(ROOT/'index.html').read_bytes(),'text/html; charset=utf-8')
